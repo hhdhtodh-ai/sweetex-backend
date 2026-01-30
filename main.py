@@ -1,73 +1,113 @@
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    try:
-        data = request.get_json(force=True)
+# =========================
+# Sweetex AI - Render Ready Backend
+# =========================
 
-        pair = data.get("pair", "").upper()
-        market = data.get("market", "")
+import os
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-        if not pair:
-            return jsonify({"error": "Pair required"}), 400
+app = Flask(__name__)
+CORS(app)
 
-        # Binance symbol format
-        symbol = pair.replace("/", "")
+BINANCE_API = "https://api.binance.com/api/v3/klines"
 
-        # ===== LIVE PRICE =====
-        price_url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-        price_res = requests.get(price_url).json()
-        price = float(price_res["price"])
+# =========================
+# INDICATORS
+# =========================
 
-        # ===== CANDLES =====
-        kline_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
-        klines = requests.get(kline_url).json()
-        closes = [float(k[4]) for k in klines]
+def ema(prices, period):
+    k = 2 / (period + 1)
+    ema_val = prices[0]
+    for price in prices:
+        ema_val = price * k + ema_val * (1 - k)
+    return round(ema_val, 4)
 
-        # ===== EMA =====
-        def ema(values, period=14):
-            k = 2 / (period + 1)
-            ema_val = values[0]
-            for v in values:
-                ema_val = v * k + ema_val * (1 - k)
-            return round(ema_val, 2)
+def rsi(prices, period=14):
+    gains = []
+    losses = []
 
-        # ===== RSI =====
-        def rsi(values, period=14):
-            gains = []
-            losses = []
-            for i in range(1, len(values)):
-                diff = values[i] - values[i - 1]
-                if diff > 0:
-                    gains.append(diff)
-                else:
-                    losses.append(abs(diff))
-
-            avg_gain = sum(gains[-period:]) / period
-            avg_loss = sum(losses[-period:]) / period
-
-            if avg_loss == 0:
-                return 100
-
-            rs = avg_gain / avg_loss
-            return round(100 - (100 / (1 + rs)), 2)
-
-        ema_val = ema(closes)
-        rsi_val = rsi(closes)
-
-        # ===== AI LOGIC =====
-        if rsi_val > 55 and price > ema_val:
-            signal = "CALL"
-            trend = "Bullish"
-        elif rsi_val < 45 and price < ema_val:
-            signal = "PUT"
-            trend = "Bearish"
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
         else:
-            signal = "WAIT"
-            trend = "Sideways"
+            gains.append(0)
+            losses.append(abs(diff))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+# =========================
+# MARKET DATA
+# =========================
+
+def get_prices(symbol):
+    url = f"{BINANCE_API}?symbol={symbol}&interval=1m&limit=100"
+    data = requests.get(url, timeout=10).json()
+    closes = [float(c[4]) for c in data]
+    return closes
+
+# =========================
+# SIGNAL ENGINE
+# =========================
+
+def analyze_market(prices):
+    ema50 = ema(prices, 50)
+    rsi14 = rsi(prices, 14)
+    current = prices[-1]
+
+    trend = "Bullish" if current > ema50 else "Bearish"
+
+    if trend == "Bullish" and rsi14 < 70:
+        signal = "BUY"
+    elif trend == "Bearish" and rsi14 > 30:
+        signal = "SELL"
+    else:
+        signal = "WAIT"
+
+    confidence = 50
+    if signal == "BUY":
+        confidence = min(90, int(60 + (70 - rsi14)))
+    elif signal == "SELL":
+        confidence = min(90, int(60 + (rsi14 - 30)))
+
+    return signal, trend, confidence
+
+# =========================
+# API ROUTE
+# =========================
+
+@app.route("/signal")
+def signal():
+    pair = request.args.get("pair", "BTC/USDT")
+    symbol = pair.replace("/", "")
+
+    try:
+        prices = get_prices(symbol)
+        signal, trend, confidence = analyze_market(prices)
 
         return jsonify({
+            "market": "Crypto",
+            "pair": pair,
             "signal": signal,
-            "trend": trend
+            "trend": trend,
+            "confidence": confidence
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# =========================
+# RENDER COMPATIBLE RUN
+# =========================
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
